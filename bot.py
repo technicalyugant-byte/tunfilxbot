@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import importlib.util
 import os
 import re
@@ -98,6 +99,55 @@ def get_ffmpeg_location() -> str | None:
         return None
 
 
+def get_js_runtime_arg() -> str | None:
+    deno_path = shutil.which("deno")
+    if deno_path:
+        return f"deno:{deno_path}"
+
+    project_deno_path = Path.cwd() / ".deno" / "bin" / "deno"
+    if project_deno_path.exists():
+        return f"deno:{project_deno_path}"
+
+    render_deno_path = Path.home() / ".deno" / "bin" / "deno"
+    if render_deno_path.exists():
+        return f"deno:{render_deno_path}"
+
+    node_path = shutil.which("node")
+    if node_path:
+        return f"node:{node_path}"
+
+    return None
+
+
+def get_youtube_cookies_file(temp_dir: str) -> Path | None:
+    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
+    if cookies_file and Path(cookies_file).exists():
+        return Path(cookies_file)
+
+    cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64")
+    if cookies_b64:
+        cookies_path = Path(temp_dir) / "youtube_cookies.txt"
+        cookies_path.write_bytes(base64.b64decode(cookies_b64))
+        return cookies_path
+
+    cookies_text = os.getenv("YOUTUBE_COOKIES")
+    if cookies_text:
+        cookies_path = Path(temp_dir) / "youtube_cookies.txt"
+        cookies_path.write_text(cookies_text.replace("\\n", "\n"), encoding="utf-8")
+        return cookies_path
+
+    return None
+
+
+def add_youtube_options(command: list[str], cookies_file: Path | None) -> None:
+    js_runtime = get_js_runtime_arg()
+    if js_runtime:
+        command.extend(["--js-runtimes", js_runtime])
+
+    if cookies_file:
+        command.extend(["--cookies", str(cookies_file)])
+
+
 def ensure_tools_available() -> str:
     if importlib.util.find_spec("yt_dlp") is None:
         raise RuntimeError("Missing tool: yt-dlp. Install it with: python -m pip install -r requirements.txt")
@@ -180,7 +230,13 @@ async def run_command(command: list[str]) -> tuple[int, str]:
     return process.returncode, output.decode(errors="ignore").strip()
 
 
-async def download_full_video(url: str, temp_dir: str, ffmpeg_location: str, status_message) -> tuple[Path | None, str]:
+async def download_full_video(
+    url: str,
+    temp_dir: str,
+    ffmpeg_location: str,
+    cookies_file: Path | None,
+    status_message,
+) -> tuple[Path | None, str]:
     output_template = str(Path(temp_dir) / "source.%(ext)s")
     command = [
         sys.executable,
@@ -196,8 +252,9 @@ async def download_full_video(url: str, temp_dir: str, ffmpeg_location: str, sta
         "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b",
         "-o",
         output_template,
-        url,
     ]
+    add_youtube_options(command, cookies_file)
+    command.append(url)
 
     await safe_edit_text(status_message, "Direct clipping failed. Downloading video for local processing...")
     return_code, output = await run_command_with_progress(command, status_message)
@@ -324,6 +381,7 @@ async def download_and_send_clip(update: Update, url: str, start_seconds: int, e
     status_message = await update.message.reply_text("Creating your clip. Please wait...")
 
     with tempfile.TemporaryDirectory(prefix="tunefilx_") as temp_dir:
+        cookies_file = get_youtube_cookies_file(temp_dir)
         output_template = str(Path(temp_dir) / "clip.%(ext)s")
         section = f"*{format_time(start_seconds)}-{format_time(end_seconds)}"
 
@@ -344,14 +402,21 @@ async def download_and_send_clip(update: Update, url: str, start_seconds: int, e
             "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
             "-o",
             output_template,
-            url,
         ]
+        add_youtube_options(command, cookies_file)
+        command.append(url)
 
         return_code, output = await run_command_with_progress(command, status_message)
         used_fallback = False
 
         if return_code != 0:
-            source_file, fallback_output = await download_full_video(url, temp_dir, ffmpeg_location, status_message)
+            source_file, fallback_output = await download_full_video(
+                url,
+                temp_dir,
+                ffmpeg_location,
+                cookies_file,
+                status_message,
+            )
             if source_file is None:
                 await status_message.edit_text(
                     "The clip could not be downloaded.\n"
