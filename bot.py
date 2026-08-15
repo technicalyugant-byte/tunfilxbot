@@ -34,7 +34,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MAX_TELEGRAM_UPLOAD_MB = 49
 TIME_RE = re.compile(r"^\d{1,2}(:\d{1,2}){0,2}$")
 DOWNLOAD_PERCENT_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
-ASK_LINK, ASK_START, ASK_END = range(3)
+ASK_LINK, ASK_START, ASK_END, ASK_UPLOAD_START, ASK_UPLOAD_END = range(5)
 
 
 def parse_time(value: str) -> int:
@@ -146,6 +146,25 @@ def add_youtube_options(command: list[str], cookies_file: Path | None) -> None:
 
     if cookies_file:
         command.extend(["--cookies", str(cookies_file)])
+
+
+def build_download_error(output: str) -> str:
+    if "Sign in to confirm" in output or "--cookies-from-browser or --cookies" in output:
+        return (
+            "YouTube is blocking this server as a bot.\n\n"
+            "Fix on Render:\n"
+            "1. Export YouTube cookies as a Netscape cookies.txt file.\n"
+            "2. Convert it to base64.\n"
+            "3. Add it on Render as YOUTUBE_COOKIES_B64.\n"
+            "4. Redeploy the service.\n\n"
+            "Do not share your cookies publicly."
+        )
+
+    return (
+        "The clip could not be downloaded.\n"
+        "Make sure the link is public and the time range is valid.\n\n"
+        f"Error: {output[-800:]}"
+    )
 
 
 def ensure_tools_available() -> str:
@@ -304,7 +323,7 @@ async def cut_local_clip(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! Welcome to Tunefilx.\n\n"
-        "Send a YouTube video link to download a clip.\n"
+        "Send a YouTube video link or upload a video file.\n"
         "I will ask for the start point and end point."
     )
 
@@ -315,8 +334,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Send the YouTube video link.")
+    await update.message.reply_text("Send the YouTube video link or upload a video file.")
     return ASK_LINK
+
+
+async def receive_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    video = update.message.video
+    document = update.message.document
+
+    if video:
+        file_id = video.file_id
+        file_name = "uploaded_video.mp4"
+        file_size = video.file_size
+    elif document and document.mime_type and document.mime_type.startswith("video/"):
+        file_id = document.file_id
+        file_name = document.file_name or "uploaded_video.mp4"
+        file_size = document.file_size
+    else:
+        await update.message.reply_text("Please upload a valid video file.")
+        return ASK_LINK
+
+    context.user_data.clear()
+    context.user_data["upload_file_id"] = file_id
+    context.user_data["upload_file_name"] = file_name
+    context.user_data["upload_file_size"] = file_size
+    await update.message.reply_text("Video received. Send the start point.\nExample: 10, 01:20, or 00:01:20")
+    return ASK_UPLOAD_START
 
 
 async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -344,6 +387,20 @@ async def receive_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_END
 
 
+async def receive_upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_raw = update.message.text.strip()
+
+    try:
+        start_seconds = parse_time(start_raw)
+    except ValueError as exc:
+        await update.message.reply_text(f"{exc}\nUse: 10, 01:20, or 00:01:20")
+        return ASK_UPLOAD_START
+
+    context.user_data["start_seconds"] = start_seconds
+    await update.message.reply_text("Send the end point.\nExample: 02:10")
+    return ASK_UPLOAD_END
+
+
 async def receive_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end_raw = update.message.text.strip()
 
@@ -361,6 +418,26 @@ async def receive_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_END
 
     await download_and_send_clip(update, url, start_seconds, end_seconds)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def receive_upload_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    end_raw = update.message.text.strip()
+
+    try:
+        end_seconds = parse_time(end_raw)
+    except ValueError as exc:
+        await update.message.reply_text(f"{exc}\nUse: 10, 01:20, or 00:01:20")
+        return ASK_UPLOAD_END
+
+    start_seconds = context.user_data["start_seconds"]
+
+    if start_seconds >= end_seconds:
+        await update.message.reply_text("The end point must be after the start point.")
+        return ASK_UPLOAD_END
+
+    await cut_uploaded_video(update, context, start_seconds, end_seconds)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -418,11 +495,7 @@ async def download_and_send_clip(update: Update, url: str, start_seconds: int, e
                 status_message,
             )
             if source_file is None:
-                await status_message.edit_text(
-                    "The clip could not be downloaded.\n"
-                    "Make sure the link is public and the time range is valid.\n\n"
-                    f"Error: {fallback_output[-800:]}"
-                )
+                await status_message.edit_text(build_download_error(fallback_output))
                 return
 
             local_clip = Path(temp_dir) / "clip_local.mp4"
@@ -469,6 +542,57 @@ async def download_and_send_clip(update: Update, url: str, start_seconds: int, e
         await status_message.delete()
 
 
+async def cut_uploaded_video(update: Update, context: ContextTypes.DEFAULT_TYPE, start_seconds: int, end_seconds: int):
+    try:
+        ffmpeg_location = ensure_tools_available()
+    except RuntimeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    status_message = await update.message.reply_text("Downloading your uploaded video...")
+
+    with tempfile.TemporaryDirectory(prefix="tunefilx_upload_") as temp_dir:
+        file_name = Path(context.user_data["upload_file_name"]).name
+        source_file = Path(temp_dir) / file_name
+        output_file = Path(temp_dir) / "uploaded_clip.mp4"
+
+        telegram_file = await context.bot.get_file(context.user_data["upload_file_id"])
+        await telegram_file.download_to_drive(custom_path=source_file)
+
+        cut_code, cut_output = await cut_local_clip(
+            source_file,
+            output_file,
+            ffmpeg_location,
+            start_seconds,
+            end_seconds,
+            status_message,
+        )
+        if cut_code != 0:
+            await status_message.edit_text(
+                "The uploaded video could not be clipped.\n"
+                "Try a shorter clip or a different time range.\n\n"
+                f"Error: {cut_output[-800:]}"
+            )
+            return
+
+        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+        if file_size_mb > MAX_TELEGRAM_UPLOAD_MB:
+            await status_message.edit_text(
+                f"The clip was created, but its size is {file_size_mb:.1f} MB. "
+                f"Please make a shorter clip under {MAX_TELEGRAM_UPLOAD_MB} MB for Telegram upload."
+            )
+            return
+
+        await status_message.edit_text("Clip is ready. Uploading now...")
+        with output_file.open("rb") as video:
+            await update.message.reply_video(
+                video=video,
+                caption=f"Clip: {format_time(start_seconds)} - {format_time(end_seconds)}",
+                supports_streaming=True,
+            )
+        await status_message.delete()
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set the TELEGRAM_BOT_TOKEN environment variable or add it to the .env file.")
@@ -481,11 +605,17 @@ def main():
             entry_points=[
                 CommandHandler("clip", clip),
                 MessageHandler(filters.Regex(r"(youtube\.com/|youtu\.be/)") & ~filters.COMMAND, receive_link),
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video_upload),
             ],
             states={
-                ASK_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link)],
+                ASK_LINK: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link),
+                    MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video_upload),
+                ],
                 ASK_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_start)],
                 ASK_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_end)],
+                ASK_UPLOAD_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_upload_start)],
+                ASK_UPLOAD_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_upload_end)],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
