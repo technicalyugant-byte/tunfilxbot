@@ -1,0 +1,8 @@
+name = "tunefilxbot"
+main = "src/index.js"
+compatibility_date = "2026-08-15"
+
+[vars]
+# Set these in Cloudflare dashboard Secrets/Variables:
+# TELEGRAM_BOT_TOKEN
+# VIDEO_BACKEND_URL
